@@ -69,7 +69,8 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   // 2) Did anything actually change?
   const status = git(["status", "--porcelain"], dir);
   if (!status) return { siteId, ok: false, status: "no_change", report: agent.text };
-  const files = status.split("\n").map((l) => l.slice(3).trim()).filter(Boolean);
+  // porcelain v1 lines are "XY <path>"; slice past the 2 status chars + trim the separator.
+  const files = status.split("\n").filter(Boolean).map((l) => l.slice(2).trim());
   log(`[diff] ${files.length} file(s): ${files.join(", ")}`);
 
   // 3) Guard: never accept edits to the generated output dir.
