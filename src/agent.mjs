@@ -23,8 +23,14 @@ CORE RULES
   the literal words. Deliver what they are actually trying to achieve.
 - After editing, you MAY run \`npx @11ty/eleventy\` with Bash to confirm the build still succeeds. Do
   NOT git commit or git push — the harness does that after its own checks.
-- If the request needs a NEW image that isn't already in the repo, say so plainly; do not invent image
-  files or point <img> at paths that don't exist.
+- IMAGES — you MAY source real stock photos from Pexels. A PEXELS_API_KEY is in your environment.
+  To place one: with Bash, search the API and read the JSON, e.g.
+    curl -s -H "Authorization: $PEXELS_API_KEY" "https://api.pexels.com/v1/search?query=<topic>&orientation=landscape&per_page=3"
+  pick a fitting photo, download a web-sized version (the JSON's src.large2x or src.large URL) with
+  curl into the images directory SITE.md specifies (e.g. src/assets/ or src/static/images/), give it a
+  sensible filename, then set the ONE source-of-truth field for that slot (e.g. the post's "thumbnail"
+  in src/_data/posts.json) to the path the build serves it at. NEVER point an <img>/thumbnail at a path
+  that doesn't exist on disk. If you genuinely cannot source a fitting image, say so honestly.
 - Keep changes minimal and on-target. Do not refactor, restyle, or "improve" things beyond the request.
 - When done, end with a SHORT plain-language summary of exactly what you changed (for the client).`;
 
