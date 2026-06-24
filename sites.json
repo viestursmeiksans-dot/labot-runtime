@@ -1,0 +1,14 @@
+{
+  "resonatekit": {
+    "repo": "viestursmeiksans-dot/resonatekit-web",
+    "branch": "main",
+    "build": "npm ci && npx @11ty/eleventy",
+    "model": "claude-sonnet-4-6"
+  },
+  "sintija-dance": {
+    "repo": "viestursmeiksans-dot/sintija-dance-web",
+    "branch": "main",
+    "build": "npm ci && npx @11ty/eleventy",
+    "model": "claude-sonnet-4-6"
+  }
+}

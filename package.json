@@ -1,0 +1,13 @@
+{
+  "name": "labot-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "labot.lv VPS agent runtime — Claude Agent SDK edits a site's Eleventy source, builds, QA-gates, and pushes (GitHub Action deploys).",
+  "scripts": {
+    "job": "node src/run.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.190"
+  }
+}
