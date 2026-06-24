@@ -1,0 +1,18 @@
+[Unit]
+Description=labot.lv VPS agent poller (drains the intake queue, runs edit jobs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=labot
+WorkingDirectory=/srv/labot/labot-runtime
+EnvironmentFile=/srv/labot/labot-runtime/.env
+ExecStart=/usr/bin/node src/poll.mjs
+Restart=always
+RestartSec=5
+# light hardening
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
