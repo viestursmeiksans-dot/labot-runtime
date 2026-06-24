@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 User=labot
 WorkingDirectory=/srv/labot/labot-runtime
-EnvironmentFile=/srv/labot/labot-runtime/.env
-ExecStart=/usr/bin/node src/poll.mjs
+# Node parses the .env itself (proven-working invocation); absolute paths so cwd never matters.
+ExecStart=/usr/bin/node --env-file=/srv/labot/labot-runtime/.env /srv/labot/labot-runtime/src/poll.mjs
 Restart=always
 RestartSec=5
 # light hardening
