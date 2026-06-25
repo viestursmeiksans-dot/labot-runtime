@@ -6,7 +6,9 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { runAgentSession } from "./agent.mjs";
 
-const SITES = JSON.parse(readFileSync(new URL("../sites.json", import.meta.url)));
+// Read sites.json FRESH per job (not cached at module load) so adding a site to the registry
+// takes effect after a plain `git pull` on the box — no poller restart needed.
+const loadSites = () => JSON.parse(readFileSync(new URL("../sites.json", import.meta.url)));
 const SITES_DIR = process.env.LABOT_SITES_DIR || "/srv/sites";
 
 function git(args, cwd) {
@@ -43,7 +45,7 @@ export function ensureCheckout(site) {
 }
 
 export async function runJob({ siteId, instruction, model, commit = false, log = console.log }) {
-  const site = SITES[siteId];
+  const site = loadSites()[siteId];
   if (!site) throw new Error(`unknown site '${siteId}' (add it to sites.json)`);
 
   const dir = ensureCheckout(site);
