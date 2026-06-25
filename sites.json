@@ -10,5 +10,11 @@
     "branch": "main",
     "build": "npm ci && npx @11ty/eleventy",
     "model": "claude-sonnet-4-6"
+  },
+  "corvin": {
+    "repo": "viestursmeiksans-dot/corvin-web",
+    "branch": "main",
+    "build": "npm ci && npx @11ty/eleventy",
+    "model": "claude-sonnet-4-6"
   }
 }
