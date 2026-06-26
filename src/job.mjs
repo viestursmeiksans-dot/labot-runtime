@@ -6,7 +6,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { runAgentSession } from "./agent.mjs";
 import { triage } from "./triage.mjs";
+import { splitTasks } from "./split.mjs";
 import { parseVerify, runVerification } from "./verify.mjs";
+
+// A1 hard edit-size ceiling for a tier: generous backstop (~3× the tier's intended maxEdit, floor
+// 800) so whole-file/section re-emits are blocked but genuine surgical edits never false-deny.
+const capFor = (r) => (r.maxEdit === Infinity ? Infinity : Math.max(r.maxEdit * 3, 800));
 
 // Read sites.json FRESH per job (not cached at module load) so adding a site to the registry
 // takes effect after a plain `git pull` on the box — no poller restart needed.
@@ -101,10 +106,12 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   // arg overrides (manual/test runs); otherwise the tier decides (most edits → Haiku).
   const route = triage(effectiveInstruction);
   const chosenModel = model || route.model;
-  // Hard edit-size ceiling for the A1 guard: generous backstop (~3× the tier's intended maxEdit,
-  // floor 800) so whole-file/section re-emits are blocked but genuine surgical edits never false-deny.
-  const editCap = route.maxEdit === Infinity ? Infinity : Math.max(route.maxEdit * 3, 800);
-  log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} editCap=${editCap === Infinity ? "∞" : editCap} browserVerify=${route.browserVerify}`);
+  log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} editCap=${capFor(route) === Infinity ? "∞" : capFor(route)} browserVerify=${route.browserVerify}`);
+
+  // A4: split a numbered/bulleted multi-task email into independent sub-tasks, each on its own tier.
+  // attachNote (image context) is shared across all sub-tasks. Single-task emails are unchanged.
+  const tasks = splitTasks(instruction);
+  if (tasks.length > 1) log(`[split] ${tasks.length} sub-tasks → each triaged + verified independently`);
 
   const onMessage = (m) => {
     if (m.type === "assistant" && Array.isArray(m.message?.content)) {
@@ -115,6 +122,38 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     }
   };
 
+  // One agent pass per attempt: single task → one session (unchanged); multi → one session per
+  // sub-task on its own tier, merged into the SAME result shape so build/commit/verify/retry below
+  // are identical. Per-task <VERIFY> blocks are concatenated, so the gate checks every sub-task.
+  const usageLog = (a, tier, mdl, attempt) => {
+    const u = (a.raw && a.raw.usage) || {}, mu = (a.raw && a.raw.modelUsage) || {};
+    const models = Object.keys(mu).join(",") || (a.raw && a.raw.model) || mdl;
+    log(`[usage] job_site=${siteId} tier=${tier} model=${models} in=${u.input_tokens || 0} out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_write=${u.cache_creation_input_tokens || 0} turns=${a.numTurns ?? 0} cost=$${(a.costUsd || 0).toFixed(4)} attempt=${attempt}`);
+  };
+  async function editPhase(feedback, attempt) {
+    if (tasks.length === 1) {
+      const a = await runAgentSession({ cwd: dir, instruction: tasks[0] + attachNote + feedback, model: chosenModel, maxTurns: route.maxTurns, editCap: capFor(route), onMessage });
+      usageLog(a, route.tier, chosenModel, attempt);
+      return a;
+    }
+    const summaries = [], allChecks = [];
+    let cost = 0, turns = 0, ok = true;
+    for (let i = 0; i < tasks.length; i++) {
+      const tr = triage(tasks[i]);
+      const mdl = model || tr.model;
+      log(`[split] task ${i + 1}/${tasks.length} tier=${tr.tier} model=${mdl} :: ${tasks[i].replace(/\s+/g, " ").slice(0, 70)}`);
+      const a = await runAgentSession({ cwd: dir, instruction: tasks[i] + attachNote + feedback, model: mdl, maxTurns: tr.maxTurns, editCap: capFor(tr), onMessage });
+      usageLog(a, tr.tier, mdl, attempt);
+      cost += a.costUsd || 0; turns += a.numTurns || 0; ok = ok && a.ok;
+      const prose = String(a.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+      if (prose) summaries.push(`• ${prose}`);
+      for (const c of parseVerify(a.text) || []) allChecks.push(c);
+      if (!a.ok) break; // a broken sub-task aborts the pass (caller reports agent_error)
+    }
+    const text = summaries.join("\n") + (allChecks.length ? `\n\n<VERIFY>${JSON.stringify(allChecks)}</VERIFY>` : "");
+    return { ok, text, costUsd: cost, numTurns: turns, raw: {} };
+  }
+
   // Retry-on-verify-fail loop (spec B2): if the deterministic check says it isn't live+working, feed
   // the failure back to the SAME agent and retry within budget — no separate AI grading pass.
   const UNVERIFIED_NOTE = `\n\n⏳ Piezīme: daļu no izmaiņām mūsu komanda vēl pārbauda un pabeidz — par to informēsim atsevišķi. (Pārējais jau ir publicēts.)`;
@@ -124,13 +163,10 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (attempt > 1) log(`[retry] attempt ${attempt}/${MAX_ATTEMPTS} — re-running agent with verification feedback`);
 
-    // 1) Agent edits the source.
-    const agent = await runAgentSession({ cwd: dir, instruction: effectiveInstruction + feedback, model: chosenModel, maxTurns: route.maxTurns, editCap, onMessage });
+    // 1) Agent edits the source (single session, or one per sub-task — merged result either way).
+    const agent = await editPhase(feedback, attempt);
     totalCost += agent.costUsd || 0;
-    const _u = (agent.raw && agent.raw.usage) || {}, _mu = (agent.raw && agent.raw.modelUsage) || {};
-    const _models = Object.keys(_mu).join(",") || (agent.raw && agent.raw.model) || chosenModel;
     log(`[agent] done ok=${agent.ok} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
-    log(`[usage] job_site=${siteId} tier=${route.tier} model=${_models} in=${_u.input_tokens || 0} out=${_u.output_tokens || 0} cache_read=${_u.cache_read_input_tokens || 0} cache_write=${_u.cache_creation_input_tokens || 0} turns=${agent.numTurns ?? 0} cost=$${(agent.costUsd || 0).toFixed(4)} attempt=${attempt}`);
     if (!agent.ok) return { siteId, ok: false, status: "agent_error", report: agent.text || agent.error, costUsd: totalCost };
 
     // 2) Did anything change?
