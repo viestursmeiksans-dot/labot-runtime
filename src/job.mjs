@@ -130,118 +130,113 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     const models = Object.keys(mu).join(",") || (a.raw && a.raw.model) || mdl;
     log(`[usage] job_site=${siteId} tier=${tier} model=${models} in=${u.input_tokens || 0} out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_write=${u.cache_creation_input_tokens || 0} turns=${a.numTurns ?? 0} cost=$${(a.costUsd || 0).toFixed(4)} attempt=${attempt}`);
   };
-  async function editPhase(feedback, attempt) {
+  // Install deps ONCE up front (git clean -fd wiped node_modules), so the per-task build check is a
+  // fast Eleventy compile, not a full reinstall each time.
+  const compileCmd = site.compile || "npx @11ty/eleventy";
+  if (existsSync(path.join(dir, "package.json")) && !existsSync(path.join(dir, "node_modules"))) {
+    log(`[qa] installing deps (npm ci)…`);
+    if (!run(site.install || "npm ci", dir).ok) log(`[qa] npm ci reported issues (per-task build will catch real breakage)`);
+  }
+  const rollback = () => { git(["reset", "--hard", "HEAD"], dir); try { git(["clean", "-fd"], dir); } catch {} };
+
+  // Per-task build ISOLATION: each sub-task that completes AND builds is committed as a local
+  // checkpoint; a task that crashes (max_turns), edits generated files, or breaks the build is rolled
+  // back to the last good checkpoint — so a poisoned partial can NEVER cascade into its sibling tasks
+  // (the runasskola policy-modal self-include recursion that broke all 10 tasks taught us this).
+  // Commits are local; the push happens once at the end (only when commit=true).
+  async function runTasks(feedback, attempt) {
     const multi = tasks.length > 1;
     const summaries = [], allChecks = [], incomplete = [];
-    let cost = 0, turns = 0, completed = 0;
+    let cost = 0, turns = 0, committed = 0;
     for (let i = 0; i < tasks.length; i++) {
       const tr = triage(tasks[i]);
       const mdl = model || tr.model;
-      // Image/attachment work is tool-heavy on a box with no image libraries → grant extra turns.
-      const maxTurns = tr.maxTurns + (attachNote ? 6 : 0);
-      if (multi) log(`[split] task ${i + 1}/${tasks.length} tier=${tr.tier} model=${mdl} turns=${maxTurns} :: ${tasks[i].replace(/\s+/g, " ").slice(0, 70)}`);
+      const maxTurns = tr.maxTurns + (attachNote ? 6 : 0); // image/attachment work is tool-heavy
+      const label = `task ${i + 1}/${tasks.length}`;
+      if (multi) log(`[split] ${label} tier=${tr.tier} model=${mdl} turns=${maxTurns} :: ${tasks[i].replace(/\s+/g, " ").slice(0, 70)}`);
       let a;
       try {
         a = await runAgentSession({ cwd: dir, instruction: tasks[i] + attachNote + feedback, model: mdl, maxTurns, editCap: capFor(tr), onMessage });
         usageLog(a, tr.tier, mdl, attempt);
+        cost += a.costUsd || 0; turns += a.numTurns || 0;
       } catch (e) {
-        // The SDK THROWS on max_turns (and some transient errors). Never crash the job or discard the
-        // tree — a partly-finished task may have left valid edits. Record it as incomplete and move
-        // on; the build/verify gate below decides what actually ships. (This is the fix for the v1
-        // bug where one over-budget sub-task emitted a raw "maximum number of turns" to the client.)
+        // SDK throws on max_turns (and some transient errors). Roll back partial edits; never cascade.
         const reason = /maximum number of turns/i.test(String(e)) ? "did not finish within the turn budget" : String(e).slice(0, 100);
-        log(`[split] task ${i + 1} INCOMPLETE (${reason}) — keeping any partial edits, continuing`);
-        incomplete.push({ task: tasks[i], reason });
-        continue;
+        log(`[${label}] INCOMPLETE (${reason}) — rolling back its partial edits`);
+        rollback(); incomplete.push({ task: tasks[i], reason }); continue;
       }
-      cost += a.costUsd || 0; turns += a.numTurns || 0;
-      if (a.ok) {
-        completed++;
-        const prose = String(a.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+      if (!a.ok) { log(`[${label}] could not complete — rolling back`); rollback(); incomplete.push({ task: tasks[i], reason: a.error || "could not complete" }); continue; }
+
+      const st = git(["status", "--porcelain"], dir);
+      const prose = String(a.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+      const checks = parseVerify(a.text) || [];
+      if (!st) { // ran but changed nothing (e.g. "check if X works" → nothing to fix)
         if (prose) summaries.push(multi ? `• ${prose}` : prose);
-        for (const c of parseVerify(a.text) || []) allChecks.push(c);
-      } else {
-        incomplete.push({ task: tasks[i], reason: a.error || "could not complete" });
+        for (const c of checks) allChecks.push(c);
+        log(`[${label}] no change needed`); continue;
       }
+      const files = st.split("\n").filter(Boolean).map((l) => l.slice(2).trim());
+      if (files.some((f) => f.startsWith("_site/"))) { log(`[${label}] touched generated _site/ — rolling back`); rollback(); incomplete.push({ task: tasks[i], reason: "edited generated files" }); continue; }
+
+      if (!run(compileCmd, dir).ok) { log(`[${label}] build BROKE — rolling back (protects sibling tasks)`); rollback(); incomplete.push({ task: tasks[i], reason: "the change did not build" }); continue; }
+
+      git(["add", "-A"], dir);
+      git(["commit", "-m", `labot: ${tasks[i].replace(/\s+/g, " ").slice(0, 60)}`], dir);
+      committed++;
+      if (prose) summaries.push(multi ? `• ${prose}` : prose);
+      for (const c of checks) allChecks.push(c);
+      log(`[${label}] ✓ committed + builds (${files.join(", ")})`);
     }
-    const text = summaries.join("\n") + (allChecks.length ? `\n\n<VERIFY>${JSON.stringify(allChecks)}</VERIFY>` : "");
-    // ok = "proceed to the gate". The tree gate (changed? builds? verifies?) is the real arbiter, even
-    // for partial runs — so we proceed whenever anything ran, and report incompletes honestly.
-    return { ok: completed > 0 || incomplete.length > 0, text, costUsd: cost, numTurns: turns, incomplete, raw: {} };
+    return { summaries, allChecks, incomplete, cost, turns, committed };
   }
   // Honest, non-technical Latvian suffix for any tasks we could not finish (NEVER a raw stack trace).
   const incompleteSuffix = (inc) => inc && inc.length
     ? `\n\n⏳ Šīs daļas mēs vēl pabeidzam un informēsim atsevišķi:\n${inc.map((t) => `  – ${String(t.task).replace(/\s+/g, " ").slice(0, 90)}`).join("\n")}`
     : "";
 
-  // Retry-on-verify-fail loop (spec B2): if the deterministic check says it isn't live+working, feed
-  // the failure back to the SAME agent and retry within budget — no separate AI grading pass.
+  // Retry-on-verify-fail loop (spec B2): feed deterministic check failures back to the agent and retry
+  // within budget. Bounded to SINGLE-task jobs — a multi-task retry would re-invoke every sub-agent.
   const UNVERIFIED_NOTE = `\n\n⏳ Piezīme: daļu no izmaiņām mūsu komanda vēl pārbauda un pabeidz — par to informēsim atsevišķi. (Pārējais jau ir publicēts.)`;
-  const MAX_ATTEMPTS = commit && site.url ? (route.browserVerify ? 3 : 2) : 1;
+  const MAX_ATTEMPTS = (commit && site.url && tasks.length === 1) ? (route.browserVerify ? 3 : 2) : 1;
   let feedback = "", totalCost = 0, lastUnverified = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) log(`[retry] attempt ${attempt}/${MAX_ATTEMPTS} — re-running agent with verification feedback`);
+    if (attempt > 1) log(`[retry] attempt ${attempt}/${MAX_ATTEMPTS} — re-running with verification feedback`);
 
-    // 1) Agent edits the source (single session, or one per sub-task — merged result either way).
-    const agent = await editPhase(feedback, attempt);
-    totalCost += agent.costUsd || 0;
-    const incNote = incompleteSuffix(agent.incomplete);
-    log(`[agent] done completed=${agent.ok} incomplete=${(agent.incomplete || []).length} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
+    const r = await runTasks(feedback, attempt);
+    totalCost += r.cost;
+    const incNote = incompleteSuffix(r.incomplete);
+    log(`[job] committed_tasks=${r.committed} incomplete=${r.incomplete.length} cost=$${totalCost.toFixed(3)} turns=${r.turns}`);
 
-    // 2) Did anything change? (Even a crashed/over-budget sub-task may have left valid partial edits.)
-    const status = git(["status", "--porcelain"], dir);
-    if (!status) {
-      // Nothing shippable in the tree. If some tasks failed, say so honestly — never a stack trace.
-      if ((agent.incomplete || []).length) {
-        return { siteId, ok: false, status: "incomplete", costUsd: totalCost,
-          report: `Pagaidām šo nepaspējām pabeigt automātiski — mūsu komanda to pārņem un izdarīs manuāli.${incNote}` };
-      }
-      if (attempt === 1) return { siteId, ok: false, status: "no_change", report: agent.text, costUsd: totalCost };
-      log(`[retry] agent made no further change — keeping last pushed result`);
-      return lastUnverified;
+    // Nothing shippable committed. Report honestly — never a stack trace, never silent.
+    if (r.committed === 0) {
+      if (attempt > 1 && lastUnverified) { log(`[retry] no further fix committed — keeping prior pushed result`); return lastUnverified; }
+      if (r.incomplete.length) return { siteId, ok: false, status: "incomplete", costUsd: totalCost,
+        report: `Pagaidām šo nepaspējām pabeigt automātiski — mūsu komanda to pārņem un izdarīs manuāli.${incNote}` };
+      return { siteId, ok: false, status: "no_change", costUsd: totalCost, report: r.summaries.join("\n") || "Pārbaudīju — nekas nebija jāmaina." };
     }
-    const files = status.split("\n").filter(Boolean).map((l) => l.slice(2).trim());
-    log(`[diff] ${files.length} file(s): ${files.join(", ")}`);
 
-    // 3) Guard: never accept _site/ edits.
-    const generated = files.filter((f) => f.startsWith("_site/"));
-    if (generated.length) { git(["checkout", "--", "."], dir); return { siteId, ok: false, status: "touched_generated", report: agent.text, files: generated, costUsd: totalCost }; }
-
-    // 4) Build gate.
-    log(`[qa] building…`);
-    const build = run(site.build || "npm ci && npx @11ty/eleventy", dir);
-    if (!build.ok) {
-      git(["checkout", "--", "."], dir);
-      if (attempt > 1 && lastUnverified) { log(`[retry] retry edit broke the build — keeping the prior pushed version`); return lastUnverified; }
-      return { siteId, ok: false, status: "build_failed", report: agent.text, buildOut: build.out.slice(-1200), costUsd: totalCost };
-    }
-    log(`[qa] build OK`);
-
-    // 5) Commit + push.
+    // Push the per-task checkpoint commits once.
     let committedSha = null;
     if (commit) {
-      git(["add", "-A"], dir);
-      git(["commit", "-m", `labot: ${instruction.replace(/\s+/g, " ").slice(0, 60)}`], dir);
       git(["push", "origin", site.branch], dir);
       committedSha = git(["rev-parse", "HEAD"], dir);
       log(`[push] ${committedSha} → origin/${site.branch} (Action will deploy)`);
-    } else { log(`[dry-run] build passed; NOT committing (pass commit:true / --commit to push)`); }
+    } else { log(`[dry-run] ${r.committed} task(s) built + committed locally; NOT pushing`); }
 
-    // 6) Verification done-gate. No model self-grading: wait for the live deploy, assert facts.
-    const clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim() + incNote;
+    const clientReport = r.summaries.join("\n") + incNote;
     if (!commit || !site.url) {
-      return { siteId, ok: true, status: commit ? "committed" : "dry_run", tier: route.tier, model: chosenModel, verified: null, verifyResults: [], files, committedSha, costUsd: totalCost, report: clientReport };
+      return { siteId, ok: true, status: commit ? "committed" : "dry_run", tier: route.tier, model: chosenModel, verified: null, verifyResults: [], committedSha, costUsd: totalCost, report: clientReport };
     }
-    const checks = parseVerify(agent.text);
-    log(`[verify] deploying… checking ${checks ? checks.length : 0} declared assertion(s) on ${site.url}`);
-    const v = await runVerification(site.url, checks, { log });
-    log(`[verify] ${v.verified ? "✅ VERIFIED" : "⚠️ UNVERIFIED"} (${v.results.filter((r) => r.ok).length}/${v.results.length} checks passed)`);
+
+    // Verification done-gate over the union of committed tasks' declared checks.
+    log(`[verify] deploying… checking ${r.allChecks.length} declared assertion(s) on ${site.url}`);
+    const v = await runVerification(site.url, r.allChecks, { log });
+    log(`[verify] ${v.verified ? "✅ VERIFIED" : "⚠️ UNVERIFIED"} (${v.results.filter((x) => x.ok).length}/${v.results.length} checks passed)`);
     if (v.verified) {
-      return { siteId, ok: true, status: "committed", tier: route.tier, model: chosenModel, verified: true, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport };
+      return { siteId, ok: true, status: "committed", tier: route.tier, model: chosenModel, verified: true, verifyResults: v.results, committedSha, costUsd: totalCost, report: clientReport };
     }
-    // Unverified — remember the honest result; retry with concrete feedback if budget remains.
-    lastUnverified = { siteId, ok: true, status: "committed_unverified", tier: route.tier, model: chosenModel, verified: false, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport + UNVERIFIED_NOTE };
+    lastUnverified = { siteId, ok: true, status: "committed_unverified", tier: route.tier, model: chosenModel, verified: false, verifyResults: v.results, committedSha, costUsd: totalCost, report: clientReport + UNVERIFIED_NOTE };
     if (attempt < MAX_ATTEMPTS) {
       feedback = `\n\n[VERIFICATION FAILED on your last attempt — the change is LIVE but a deterministic browser/HTTP check shows it is NOT working as intended:\n${summarizeFailures(v.results)}\nInvestigate the actual deployed page and the source, find the real cause, and fix it (do not just repeat the same edit). Then re-declare the <VERIFY> block.]`;
       continue;

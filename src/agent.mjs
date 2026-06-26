@@ -83,6 +83,11 @@ CORE RULES
   in src/_data/posts.json) to the path the build serves it at. NEVER point an <img>/thumbnail at a path
   that doesn't exist on disk. If you genuinely cannot source a fitting image, say so honestly.
 - Keep changes minimal and on-target. Do not refactor, restyle, or "improve" things beyond the request.
+- TEMPLATE SAFETY: HTML comments (<!-- -->) do NOT disable Nunjucks/Liquid tags — a \`{% include %}\` or
+  \`{% ... %}\` inside an HTML comment STILL executes. When you extract a block into an include, never
+  leave a reference to that include inside the include itself (it self-includes → infinite recursion →
+  build crash). After any template/include change, run \`npx @11ty/eleventy\` and confirm it builds before
+  you finish — a change that doesn't build will be rolled back and the task counts as failed.
 
 COST DISCIPLINE (do this — it is enforced)
 - SURGICAL EDITS ONLY. Make the SMALLEST possible edit: replace only the characters that change.
