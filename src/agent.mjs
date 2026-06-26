@@ -97,6 +97,13 @@ COST DISCIPLINE (do this — it is enforced)
   alt text, price, id), then read only the ±30 lines around it and edit from that slice. Reading a
   big file whole will be REJECTED — grep first, read the section.
 
+FEASIBILITY (save the budget; be honest)
+- If a task needs data you genuinely cannot obtain — content behind a login (e.g. scraping Instagram
+  posts), third-party reviews you can't reach, an asset only the client has — do NOT thrash retrying
+  for many turns. Make ONE reasonable attempt; if it won't work, STOP and state plainly what you need
+  from the client (e.g. "please attach the Instagram images you want shown"). A clean hand-back in 2–3
+  turns is far better than burning the whole budget and failing.
+
 VERIFICATION (REQUIRED — you cannot be marked "done" without it)
 - A human is NOT watching. Before anything ships, a browser/HTTP check confirms your change is live
   and correct. You MUST tell that checker how to prove your work. End your reply with a single block:
@@ -129,17 +136,53 @@ export async function runAgentSession({ cwd, instruction, model = "claude-sonnet
     },
   });
 
-  let result = null;
-  for await (const m of q) {
-    if (onMessage) onMessage(m);
-    if (m.type === "result") result = m;
+  // Accumulate usage from the stream so we have per-task telemetry EVEN when the SDK throws on
+  // max_turns (it throws before emitting a result message). Output tokens sum across turns; input/cache
+  // are cumulative-context, so we keep the max seen. On a clean finish the result message's exact
+  // totals + total_cost_usd win; on a throw we fall back to this accumulator with an estimated cost.
+  const acc = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  let result = null, turnsSeen = 0, thrown = null;
+  try {
+    for await (const m of q) {
+      if (onMessage) onMessage(m);
+      const u = m.type === "assistant" ? m.message?.usage : null;
+      if (u) {
+        acc.output_tokens += u.output_tokens || 0;
+        acc.input_tokens = Math.max(acc.input_tokens, u.input_tokens || 0);
+        acc.cache_read_input_tokens = Math.max(acc.cache_read_input_tokens, u.cache_read_input_tokens || 0);
+        acc.cache_creation_input_tokens = Math.max(acc.cache_creation_input_tokens, u.cache_creation_input_tokens || 0);
+        turnsSeen++;
+      }
+      if (m.type === "result") result = m;
+    }
+  } catch (e) {
+    thrown = e; // typically "Reached maximum number of turns (N)"
   }
-  if (!result) return { ok: false, error: "agent produced no result message", text: "", costUsd: 0 };
+  if (result) {
+    return { ok: result.subtype === "success", text: result.result ?? "", costUsd: result.total_cost_usd ?? 0, numTurns: result.num_turns, raw: result };
+  }
+  // No result message → SDK threw (e.g. max_turns). Return structured failure WITH best-effort usage.
+  const maxedOut = /maximum number of turns/i.test(String(thrown || ""));
   return {
-    ok: result.subtype === "success",
-    text: result.result ?? "",
-    costUsd: result.total_cost_usd ?? 0,
-    numTurns: result.num_turns,
-    raw: result,
+    ok: false,
+    error: thrown ? String(thrown) : "agent produced no result message",
+    text: "",
+    costUsd: estimateCost(model, acc),
+    numTurns: turnsSeen,
+    raw: { usage: acc, estimated: true, maxedOut },
   };
+}
+
+// Rough per-task cost estimate (USD) from token counts, for the max_turns case where the SDK gives no
+// total_cost_usd. Prices are per million tokens; cache_read ≈0.1× input, cache_write ≈1.25× input.
+const PRICES = [
+  { m: "haiku", in: 1, out: 5 },
+  { m: "sonnet", in: 3, out: 15 },
+  { m: "opus", in: 15, out: 75 },
+];
+function estimateCost(model, u) {
+  const p = PRICES.find((x) => String(model || "").includes(x.m)) || PRICES[1];
+  return (
+    (u.input_tokens * p.in + u.output_tokens * p.out + u.cache_read_input_tokens * p.in * 0.1 + u.cache_creation_input_tokens * p.in * 1.25) / 1e6
+  );
 }

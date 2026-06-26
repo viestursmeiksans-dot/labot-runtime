@@ -128,7 +128,9 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   const usageLog = (a, tier, mdl, attempt) => {
     const u = (a.raw && a.raw.usage) || {}, mu = (a.raw && a.raw.modelUsage) || {};
     const models = Object.keys(mu).join(",") || (a.raw && a.raw.model) || mdl;
-    log(`[usage] job_site=${siteId} tier=${tier} model=${models} in=${u.input_tokens || 0} out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_write=${u.cache_creation_input_tokens || 0} turns=${a.numTurns ?? 0} cost=$${(a.costUsd || 0).toFixed(4)} attempt=${attempt}`);
+    const est = a.raw && a.raw.estimated ? " EST" : "";
+    const outcome = a.ok ? "ok" : (a.raw && a.raw.maxedOut ? "max_turns" : "fail");
+    log(`[usage] job_site=${siteId} tier=${tier} model=${models} in=${u.input_tokens || 0} out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_write=${u.cache_creation_input_tokens || 0} turns=${a.numTurns ?? 0} cost=$${(a.costUsd || 0).toFixed(4)}${est} outcome=${outcome} attempt=${attempt}`);
   };
   // Install deps ONCE up front (git clean -fd wiped node_modules), so the per-task build check is a
   // fast Eleventy compile, not a full reinstall each time.
