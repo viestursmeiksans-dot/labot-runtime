@@ -66,6 +66,11 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     },
   });
   log(`[agent] done ok=${agent.ok} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
+  // Per-job cost telemetry (parseable) — model + token usage for the cost report.
+  const _u = (agent.raw && agent.raw.usage) || {};
+  const _mu = (agent.raw && agent.raw.modelUsage) || {};
+  const _models = Object.keys(_mu).join(",") || (agent.raw && agent.raw.model) || "claude-sonnet-4-6";
+  log(`[usage] job_site=${siteId} model=${_models} in=${_u.input_tokens || 0} out=${_u.output_tokens || 0} cache_read=${_u.cache_read_input_tokens || 0} cache_write=${_u.cache_creation_input_tokens || 0} turns=${agent.numTurns ?? 0} cost=$${(agent.costUsd || 0).toFixed(4)}`);
   if (!agent.ok) return { siteId, ok: false, status: "agent_error", report: agent.text || agent.error };
 
   // 2) Did anything actually change?
