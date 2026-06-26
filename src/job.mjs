@@ -73,6 +73,19 @@ export function ensureCheckout(site) {
   return dir;
 }
 
+// Turn failed verification results into concrete feedback the agent can act on (no model grading).
+function summarizeFailures(results) {
+  return results.filter((r) => !r.ok).map((r) => {
+    if (r.type === "content") return `  - the text "${String(r.contains).slice(0, 50)}" is NOT present on ${r.page} (HTTP ${r.status})`;
+    if (r.type === "browser") {
+      if (r.skipped) return `  - ${r.page}: browser check could not run`;
+      if (r.consoleErrors) return `  - ${r.page}: ${r.consoleErrors} JavaScript console error(s) on load${r.detail?.length ? " [" + r.detail.join(", ") + "]" : ""} — a script is crashing`;
+      return `  - ${r.page}: the declared interaction did not work${r.detail?.length ? " [" + r.detail.join(", ") + "]" : ""}`;
+    }
+    return `  - a check failed on ${r.page}`;
+  }).join("\n");
+}
+
 export async function runJob({ siteId, instruction, model, commit = false, log = console.log, attachments = null, workerBase = "", secret = "" }) {
   const site = loadSites()[siteId];
   if (!site) throw new Error(`unknown site '${siteId}' (add it to sites.json)`);
@@ -90,86 +103,86 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   const chosenModel = model || route.model;
   log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} browserVerify=${route.browserVerify}`);
 
-  // 1) The agent edits the source.
-  const agent = await runAgentSession({
-    cwd: dir,
-    instruction: effectiveInstruction,
-    model: chosenModel,
-    maxTurns: route.maxTurns,
-    onMessage: (m) => {
-      if (m.type === "assistant" && Array.isArray(m.message?.content)) {
-        for (const b of m.message.content) {
-          if (b.type === "text" && b.text.trim()) log(`[agent] ${b.text.trim().slice(0, 200)}`);
-          if (b.type === "tool_use") log(`[tool]  ${b.name} ${JSON.stringify(b.input).slice(0, 120)}`);
-        }
+  const onMessage = (m) => {
+    if (m.type === "assistant" && Array.isArray(m.message?.content)) {
+      for (const b of m.message.content) {
+        if (b.type === "text" && b.text.trim()) log(`[agent] ${b.text.trim().slice(0, 200)}`);
+        if (b.type === "tool_use") log(`[tool]  ${b.name} ${JSON.stringify(b.input).slice(0, 120)}`);
       }
-    },
-  });
-  log(`[agent] done ok=${agent.ok} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
-  // Per-job cost telemetry (parseable) — model + token usage for the cost report.
-  const _u = (agent.raw && agent.raw.usage) || {};
-  const _mu = (agent.raw && agent.raw.modelUsage) || {};
-  const _models = Object.keys(_mu).join(",") || (agent.raw && agent.raw.model) || "claude-sonnet-4-6";
-  log(`[usage] job_site=${siteId} model=${_models} in=${_u.input_tokens || 0} out=${_u.output_tokens || 0} cache_read=${_u.cache_read_input_tokens || 0} cache_write=${_u.cache_creation_input_tokens || 0} turns=${agent.numTurns ?? 0} cost=$${(agent.costUsd || 0).toFixed(4)}`);
-  if (!agent.ok) return { siteId, ok: false, status: "agent_error", report: agent.text || agent.error };
+    }
+  };
 
-  // 2) Did anything actually change?
-  const status = git(["status", "--porcelain"], dir);
-  if (!status) return { siteId, ok: false, status: "no_change", report: agent.text };
-  // porcelain v1 lines are "XY <path>"; slice past the 2 status chars + trim the separator.
-  const files = status.split("\n").filter(Boolean).map((l) => l.slice(2).trim());
-  log(`[diff] ${files.length} file(s): ${files.join(", ")}`);
+  // Retry-on-verify-fail loop (spec B2): if the deterministic check says it isn't live+working, feed
+  // the failure back to the SAME agent and retry within budget — no separate AI grading pass.
+  const UNVERIFIED_NOTE = `\n\n⏳ Piezīme: daļu no izmaiņām mūsu komanda vēl pārbauda un pabeidz — par to informēsim atsevišķi. (Pārējais jau ir publicēts.)`;
+  const MAX_ATTEMPTS = commit && site.url ? (route.browserVerify ? 3 : 2) : 1;
+  let feedback = "", totalCost = 0, lastUnverified = null;
 
-  // 3) Guard: never accept edits to the generated output dir.
-  const generated = files.filter((f) => f.startsWith("_site/"));
-  if (generated.length) {
-    git(["checkout", "--", "."], dir);
-    return { siteId, ok: false, status: "touched_generated", report: agent.text, files: generated };
-  }
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) log(`[retry] attempt ${attempt}/${MAX_ATTEMPTS} — re-running agent with verification feedback`);
 
-  // 4) QA gate: the build MUST pass.
-  log(`[qa] building…`);
-  const build = run(site.build || "npm ci && npx @11ty/eleventy", dir);
-  if (!build.ok) {
-    git(["checkout", "--", "."], dir); // revert the broken edit; never commit a non-building site
-    return { siteId, ok: false, status: "build_failed", report: agent.text, buildOut: build.out.slice(-1200) };
-  }
-  log(`[qa] build OK`);
+    // 1) Agent edits the source.
+    const agent = await runAgentSession({ cwd: dir, instruction: effectiveInstruction + feedback, model: chosenModel, maxTurns: route.maxTurns, onMessage });
+    totalCost += agent.costUsd || 0;
+    const _u = (agent.raw && agent.raw.usage) || {}, _mu = (agent.raw && agent.raw.modelUsage) || {};
+    const _models = Object.keys(_mu).join(",") || (agent.raw && agent.raw.model) || chosenModel;
+    log(`[agent] done ok=${agent.ok} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
+    log(`[usage] job_site=${siteId} tier=${route.tier} model=${_models} in=${_u.input_tokens || 0} out=${_u.output_tokens || 0} cache_read=${_u.cache_read_input_tokens || 0} cache_write=${_u.cache_creation_input_tokens || 0} turns=${agent.numTurns ?? 0} cost=$${(agent.costUsd || 0).toFixed(4)} attempt=${attempt}`);
+    if (!agent.ok) return { siteId, ok: false, status: "agent_error", report: agent.text || agent.error, costUsd: totalCost };
 
-  // 5) Commit + push (the repo's GitHub Action deploys _site/ to Cloudflare Pages).
-  let committedSha = null;
-  if (commit) {
-    git(["add", "-A"], dir);
-    git(["commit", "-m", `labot: ${instruction.replace(/\s+/g, " ").slice(0, 60)}`], dir);
-    git(["push", "origin", site.branch], dir);
-    committedSha = git(["rev-parse", "HEAD"], dir);
-    log(`[push] ${committedSha} → origin/${site.branch} (Action will deploy)`);
-  } else {
-    log(`[dry-run] build passed; NOT committing (pass commit:true / --commit to push)`);
-  }
+    // 2) Did anything change?
+    const status = git(["status", "--porcelain"], dir);
+    if (!status) {
+      if (attempt === 1) return { siteId, ok: false, status: "no_change", report: agent.text, costUsd: totalCost };
+      log(`[retry] agent made no further change — keeping last pushed result`);
+      return lastUnverified;
+    }
+    const files = status.split("\n").filter(Boolean).map((l) => l.slice(2).trim());
+    log(`[diff] ${files.length} file(s): ${files.join(", ")}`);
 
-  // 6) Verification done-gate (spec Part B): NO model self-grading — wait for the deploy to go live,
-  // then a deterministic HTTP (and, when available, browser) check asserts the change is actually
-  // live + correct. If it doesn't verify, we do NOT report "done".
-  let clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
-  let verified = null, verifyResults = [];
-  if (commit && site.url) {
+    // 3) Guard: never accept _site/ edits.
+    const generated = files.filter((f) => f.startsWith("_site/"));
+    if (generated.length) { git(["checkout", "--", "."], dir); return { siteId, ok: false, status: "touched_generated", report: agent.text, files: generated, costUsd: totalCost }; }
+
+    // 4) Build gate.
+    log(`[qa] building…`);
+    const build = run(site.build || "npm ci && npx @11ty/eleventy", dir);
+    if (!build.ok) {
+      git(["checkout", "--", "."], dir);
+      if (attempt > 1 && lastUnverified) { log(`[retry] retry edit broke the build — keeping the prior pushed version`); return lastUnverified; }
+      return { siteId, ok: false, status: "build_failed", report: agent.text, buildOut: build.out.slice(-1200), costUsd: totalCost };
+    }
+    log(`[qa] build OK`);
+
+    // 5) Commit + push.
+    let committedSha = null;
+    if (commit) {
+      git(["add", "-A"], dir);
+      git(["commit", "-m", `labot: ${instruction.replace(/\s+/g, " ").slice(0, 60)}`], dir);
+      git(["push", "origin", site.branch], dir);
+      committedSha = git(["rev-parse", "HEAD"], dir);
+      log(`[push] ${committedSha} → origin/${site.branch} (Action will deploy)`);
+    } else { log(`[dry-run] build passed; NOT committing (pass commit:true / --commit to push)`); }
+
+    // 6) Verification done-gate. No model self-grading: wait for the live deploy, assert facts.
+    const clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+    if (!commit || !site.url) {
+      return { siteId, ok: true, status: commit ? "committed" : "dry_run", tier: route.tier, model: chosenModel, verified: null, verifyResults: [], files, committedSha, costUsd: totalCost, report: clientReport };
+    }
     const checks = parseVerify(agent.text);
     log(`[verify] deploying… checking ${checks ? checks.length : 0} declared assertion(s) on ${site.url}`);
     const v = await runVerification(site.url, checks, { log });
-    verified = v.verified;
-    verifyResults = v.results;
-    log(`[verify] ${verified ? "✅ VERIFIED" : "⚠️ UNVERIFIED"} (${verifyResults.filter((r) => r.ok).length}/${verifyResults.length} checks passed)`);
-    // Honest gate: never imply "done" on something we couldn't confirm is live + working.
-    if (verified === false) {
-      clientReport += `\n\n⏳ Piezīme: daļu no izmaiņām mūsu komanda vēl pārbauda un pabeidz — par to informēsim atsevišķi. (Pārējais jau ir publicēts.)`;
+    log(`[verify] ${v.verified ? "✅ VERIFIED" : "⚠️ UNVERIFIED"} (${v.results.filter((r) => r.ok).length}/${v.results.length} checks passed)`);
+    if (v.verified) {
+      return { siteId, ok: true, status: "committed", tier: route.tier, model: chosenModel, verified: true, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport };
     }
+    // Unverified — remember the honest result; retry with concrete feedback if budget remains.
+    lastUnverified = { siteId, ok: true, status: "committed_unverified", tier: route.tier, model: chosenModel, verified: false, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport + UNVERIFIED_NOTE };
+    if (attempt < MAX_ATTEMPTS) {
+      feedback = `\n\n[VERIFICATION FAILED on your last attempt — the change is LIVE but a deterministic browser/HTTP check shows it is NOT working as intended:\n${summarizeFailures(v.results)}\nInvestigate the actual deployed page and the source, find the real cause, and fix it (do not just repeat the same edit). Then re-declare the <VERIFY> block.]`;
+      continue;
+    }
+    return lastUnverified;
   }
-
-  return {
-    siteId, ok: true,
-    status: commit ? (verified === false ? "committed_unverified" : "committed") : "dry_run",
-    tier: route.tier, model: chosenModel, verified, verifyResults,
-    files, committedSha, costUsd: agent.costUsd, report: clientReport,
-  };
+  return lastUnverified;
 }
