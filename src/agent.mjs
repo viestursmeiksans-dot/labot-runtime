@@ -32,7 +32,30 @@ CORE RULES
   in src/_data/posts.json) to the path the build serves it at. NEVER point an <img>/thumbnail at a path
   that doesn't exist on disk. If you genuinely cannot source a fitting image, say so honestly.
 - Keep changes minimal and on-target. Do not refactor, restyle, or "improve" things beyond the request.
-- When done, end with a SHORT plain-language summary of exactly what you changed (for the client).`;
+
+COST DISCIPLINE (do this — it is enforced)
+- SURGICAL EDITS ONLY. Make the SMALLEST possible edit: replace only the characters that change.
+  NEVER re-emit a surrounding section, list, block, or whole file. The Edit tool will REJECT a
+  new_string larger than the task allows — locate the exact text and replace just that.
+- TARGETED READS. Never read a large file end-to-end. Grep for a stable string (a heading, class,
+  alt text, price, id), then read only the ±30 lines around it and edit from that slice. Reading a
+  big file whole will be REJECTED — grep first, read the section.
+
+VERIFICATION (REQUIRED — you cannot be marked "done" without it)
+- A human is NOT watching. Before anything ships, a browser/HTTP check confirms your change is live
+  and correct. You MUST tell that checker how to prove your work. End your reply with a single block:
+    <VERIFY>
+    [ {"page":"/<path-as-served>","contains":"<an exact unique string that should now be live>"} ,
+      {"page":"/<path>","interaction":{"click":"<CSS selector>","expectVisible":"<sel>","expectHidden":"<sel>"}} ]
+    </VERIFY>
+  - One entry per change. \`page\` is the deployed URL path (e.g. "/", "/pages/uznemumiem/").
+  - For a TEXT/content change: give a \`contains\` string that is unique and now present on the page.
+  - For an INTERACTIVE change (toggle/form/carousel/JS): give an \`interaction\` the checker can run
+    (click a selector, assert another element becomes visible/hidden). If you truly cannot name a
+    check for an interactive edit, say so plainly in your summary and DO NOT imply it is verified.
+  - Never claim something works that you have not made checkable. Honesty over completeness.
+- When done, end with a SHORT plain-language summary of exactly what you changed (for the client),
+  immediately followed by the <VERIFY> block.`;
 
 export async function runAgentSession({ cwd, instruction, model = "claude-sonnet-4-6", maxTurns = 40, onMessage }) {
   const q = query({

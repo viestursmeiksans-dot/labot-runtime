@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { runAgentSession } from "./agent.mjs";
+import { triage } from "./triage.mjs";
+import { parseVerify, runVerification } from "./verify.mjs";
 
 // Read sites.json FRESH per job (not cached at module load) so adding a site to the registry
 // takes effect after a plain `git pull` on the box — no poller restart needed.
@@ -51,11 +53,18 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   const dir = ensureCheckout(site);
   log(`[job] site=${siteId} dir=${dir} branch=${site.branch}`);
 
+  // 0) Triage + complexity routing (spec A3): pick model + turn cap by task tier. Explicit `model`
+  // arg overrides (manual/test runs); otherwise the tier decides (most edits → Haiku).
+  const route = triage(instruction);
+  const chosenModel = model || route.model;
+  log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} browserVerify=${route.browserVerify}`);
+
   // 1) The agent edits the source.
   const agent = await runAgentSession({
     cwd: dir,
     instruction,
-    model: model || site.model || "claude-sonnet-4-6",
+    model: chosenModel,
+    maxTurns: route.maxTurns,
     onMessage: (m) => {
       if (m.type === "assistant" && Array.isArray(m.message?.content)) {
         for (const b of m.message.content) {
@@ -108,8 +117,28 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     log(`[dry-run] build passed; NOT committing (pass commit:true / --commit to push)`);
   }
 
+  // 6) Verification done-gate (spec Part B): NO model self-grading — wait for the deploy to go live,
+  // then a deterministic HTTP (and, when available, browser) check asserts the change is actually
+  // live + correct. If it doesn't verify, we do NOT report "done".
+  let clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+  let verified = null, verifyResults = [];
+  if (commit && site.url) {
+    const checks = parseVerify(agent.text);
+    log(`[verify] deploying… checking ${checks ? checks.length : 0} declared assertion(s) on ${site.url}`);
+    const v = await runVerification(site.url, checks, { log });
+    verified = v.verified;
+    verifyResults = v.results;
+    log(`[verify] ${verified ? "✅ VERIFIED" : "⚠️ UNVERIFIED"} (${verifyResults.filter((r) => r.ok).length}/${verifyResults.length} checks passed)`);
+    // Honest gate: never imply "done" on something we couldn't confirm is live + working.
+    if (verified === false) {
+      clientReport += `\n\n⏳ Piezīme: daļu no izmaiņām mūsu komanda vēl pārbauda un pabeidz — par to informēsim atsevišķi. (Pārējais jau ir publicēts.)`;
+    }
+  }
+
   return {
-    siteId, ok: true, status: commit ? "committed" : "dry_run",
-    files, committedSha, costUsd: agent.costUsd, report: agent.text,
+    siteId, ok: true,
+    status: commit ? (verified === false ? "committed_unverified" : "committed") : "dry_run",
+    tier: route.tier, model: chosenModel, verified, verifyResults,
+    files, committedSha, costUsd: agent.costUsd, report: clientReport,
   };
 }

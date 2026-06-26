@@ -3,24 +3,28 @@
     "repo": "viestursmeiksans-dot/resonatekit-web",
     "branch": "main",
     "build": "npm ci && npx @11ty/eleventy",
-    "model": "claude-sonnet-4-6"
+    "model": "claude-sonnet-4-6",
+    "url": "https://resonatekit.com"
   },
   "sintija-dance": {
     "repo": "viestursmeiksans-dot/sintija-dance-web",
     "branch": "main",
     "build": "npm ci && npx @11ty/eleventy",
-    "model": "claude-sonnet-4-6"
+    "model": "claude-sonnet-4-6",
+    "url": "https://sintijadance.lv"
   },
   "corvin": {
     "repo": "viestursmeiksans-dot/corvin-web",
     "branch": "main",
     "build": "npm ci && npx @11ty/eleventy",
-    "model": "claude-sonnet-4-6"
+    "model": "claude-sonnet-4-6",
+    "url": "https://corvinmanagement.lv"
   },
   "runasskola": {
     "repo": "viestursmeiksans-dot/runasskola-web",
     "branch": "main",
     "build": "npm ci && npx @11ty/eleventy",
-    "model": "claude-sonnet-4-6"
+    "model": "claude-sonnet-4-6",
+    "url": "https://runasskola.lv"
   }
 }
