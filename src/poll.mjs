@@ -31,6 +31,7 @@ async function complete(id, result) {
       reply: result.report,
       commitSha: result.committedSha,
       costUsd: result.costUsd,
+      verified: result.verified,
     }),
   });
   if (!r.ok) console.error(`[job ${id}] complete HTTP ${r.status}`);
@@ -52,7 +53,10 @@ for (;;) {
   }
   console.log(`[job ${job.id}] site=${job.site_id} :: ${String(job.instruction).slice(0, 90)}`);
   try {
-    const result = await runJob({ siteId: job.site_id, instruction: job.instruction, commit: true });
+    const result = await runJob({
+      siteId: job.site_id, instruction: job.instruction, commit: true,
+      attachments: job.attachments, workerBase: WORKER, secret: KEY,
+    });
     await complete(job.id, result);
     console.log(`[job ${job.id}] ${result.status} files=${(result.files || []).length} cost=$${(result.costUsd || 0).toFixed(3)}`);
   } catch (e) {

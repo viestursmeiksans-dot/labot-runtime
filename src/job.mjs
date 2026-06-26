@@ -2,7 +2,7 @@
 // deterministic QA gate (something changed + build passes + only src/ touched) → commit + push.
 // The GitHub Action on the repo handles the actual Pages deploy. No model self-grading.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { runAgentSession } from "./agent.mjs";
 import { triage } from "./triage.mjs";
@@ -30,6 +30,33 @@ function repoUrl(repo) {
   return t ? `https://x-access-token:${t}@github.com/${repo}.git` : `https://github.com/${repo}.git`;
 }
 
+// Part D2: fetch the client's image attachments (stashed in R2) onto the box via the Worker, save them
+// OUTSIDE the repo, and return a note appended to the instruction telling the agent where they are.
+const ATTACH_DIR = "/srv/sites/_inbox";
+async function downloadAttachments(attachmentsJson, workerBase, secret, jobTag, log) {
+  let list;
+  try { list = JSON.parse(attachmentsJson || "[]"); } catch { return ""; }
+  if (!Array.isArray(list) || !list.length || !workerBase) return "";
+  mkdirSync(ATTACH_DIR, { recursive: true });
+  const saved = [];
+  for (const a of list.slice(0, 6)) {
+    try {
+      const url = `${workerBase}/agent/attachment?key=${encodeURIComponent(secret)}&k=${encodeURIComponent(a.key)}`;
+      const r = await fetch(url);
+      if (!r.ok) { log(`[attach] fetch ${a.filename} HTTP ${r.status}`); continue; }
+      const buf = Buffer.from(await r.arrayBuffer());
+      const safe = String(a.filename || "image").replace(/[^A-Za-z0-9._-]/g, "_");
+      const p = `${ATTACH_DIR}/${jobTag}-${safe}`;
+      writeFileSync(p, buf);
+      saved.push({ path: p, filename: a.filename || safe });
+      log(`[attach] saved ${a.filename} → ${p} (${buf.length} bytes)`);
+    } catch (e) { log(`[attach] ${a.filename} failed: ${String(e).slice(0, 60)}`); }
+  }
+  if (!saved.length) return "";
+  const lines = saved.map((s) => `  - ${s.path}  (original filename: ${s.filename})`).join("\n");
+  return `\n\n[ATTACHED IMAGES — the client attached these files; they are saved on this server at the absolute paths below. Use them to fulfil the request: with Bash, copy the relevant file into the site's image directory (see SITE.md, e.g. src/static/images/ or src/assets/) with a sensible filename, then set the ONE source-of-truth field that points at it (favicon link, a posts.json "thumbnail", an <img> src). NEVER reference an image path that does not exist on disk. If a file is not actually a usable image, say so honestly.]\n${lines}`;
+}
+
 // Fresh, deterministic working tree at /srv/sites/<repo-name> on the site's branch.
 export function ensureCheckout(site) {
   const name = site.repo.split("/")[1];
@@ -46,23 +73,27 @@ export function ensureCheckout(site) {
   return dir;
 }
 
-export async function runJob({ siteId, instruction, model, commit = false, log = console.log }) {
+export async function runJob({ siteId, instruction, model, commit = false, log = console.log, attachments = null, workerBase = "", secret = "" }) {
   const site = loadSites()[siteId];
   if (!site) throw new Error(`unknown site '${siteId}' (add it to sites.json)`);
 
   const dir = ensureCheckout(site);
   log(`[job] site=${siteId} dir=${dir} branch=${site.branch}`);
 
+  // D2: fetch any image attachments onto the box and tell the agent where they are.
+  const attachNote = await downloadAttachments(attachments, workerBase, secret, `j${siteId}-${git(["rev-parse", "--short", "HEAD"], dir)}`, log);
+  const effectiveInstruction = instruction + attachNote;
+
   // 0) Triage + complexity routing (spec A3): pick model + turn cap by task tier. Explicit `model`
   // arg overrides (manual/test runs); otherwise the tier decides (most edits → Haiku).
-  const route = triage(instruction);
+  const route = triage(effectiveInstruction);
   const chosenModel = model || route.model;
   log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} browserVerify=${route.browserVerify}`);
 
   // 1) The agent edits the source.
   const agent = await runAgentSession({
     cwd: dir,
-    instruction,
+    instruction: effectiveInstruction,
     model: chosenModel,
     maxTurns: route.maxTurns,
     onMessage: (m) => {
