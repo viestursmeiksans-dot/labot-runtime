@@ -48,20 +48,28 @@ export async function verifyContent(baseUrl, checks, { log = () => {}, timeoutMs
   return results;
 }
 
-// V2 — interactive checks (console errors + declared click/assert). Requires a headless browser on
-// the box (chromium). Until that's provisioned, return an explicit "skipped" so the gate treats the
-// interactive task as UNVERIFIED (honest), never silently "done".
-export async function verifyInteractive(baseUrl, checks, { log = () => {} } = {}) {
-  const interactive = (checks || []).filter((c) => c && c.interaction && c.page);
-  if (!interactive.length) return [];
-  let browser;
+// V2 — browser checks. Runs the console-error smoke test on EVERY changed page (catches the JS-break
+// class even when the agent declared only a content check) PLUS any declared click/assert. Requires
+// chromium on the box; if it can't launch, return an explicit failure so interactive edits stay
+// UNVERIFIED (honest), never silently "done".
+export async function verifyBrowser(baseUrl, checks, { log = () => {} } = {}) {
+  const pages = (checks || []).filter((c) => c && c.page);
+  const hasInteraction = pages.some((c) => c.interaction);
+  if (!pages.length) return [];
+  let runBrowserChecks;
   try {
-    ({ runBrowserChecks: browser } = await import("./browser.mjs"));
-  } catch {
-    log(`[verify] V2 SKIPPED (no headless browser on box yet) — ${interactive.length} interactive check(s) UNVERIFIED`);
-    return interactive.map((c) => ({ type: "interaction", page: c.page, ok: false, skipped: true }));
+    ({ runBrowserChecks } = await import("./browser.mjs"));
+  } catch (e) {
+    // No browser available. Only HARD-fail when an interactive assertion was needed; for pure content
+    // edits the V1 HTTP check already proved the change is live, so don't block on a missing browser.
+    if (hasInteraction) {
+      log(`[verify] V2 unavailable (${String(e).slice(0, 60)}) — interactive checks UNVERIFIED`);
+      return pages.filter((c) => c.interaction).map((c) => ({ type: "browser", page: c.page, ok: false, skipped: true }));
+    }
+    log(`[verify] V2 unavailable — skipping console smoke (content already verified via V1)`);
+    return [];
   }
-  return browser(baseUrl, interactive, { log });
+  return runBrowserChecks(baseUrl, pages, { log });
 }
 
 // Run the full gate. Returns { verified, results } — verified=false means do NOT claim "done".
@@ -72,7 +80,7 @@ export async function runVerification(baseUrl, checks, { log = () => {} } = {}) 
     return { verified: false, results: [], reason: "no_checks_declared" };
   }
   const v1 = await verifyContent(baseUrl, checks, { log });
-  const v2 = await verifyInteractive(baseUrl, checks, { log });
+  const v2 = await verifyBrowser(baseUrl, checks, { log });
   const results = [...v1, ...v2];
   const verified = results.length > 0 && results.every((r) => r.ok);
   return { verified, results };
