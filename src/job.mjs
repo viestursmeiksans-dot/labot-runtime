@@ -101,7 +101,10 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
   // arg overrides (manual/test runs); otherwise the tier decides (most edits → Haiku).
   const route = triage(effectiveInstruction);
   const chosenModel = model || route.model;
-  log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} browserVerify=${route.browserVerify}`);
+  // Hard edit-size ceiling for the A1 guard: generous backstop (~3× the tier's intended maxEdit,
+  // floor 800) so whole-file/section re-emits are blocked but genuine surgical edits never false-deny.
+  const editCap = route.maxEdit === Infinity ? Infinity : Math.max(route.maxEdit * 3, 800);
+  log(`[triage] tier=${route.tier} tasks=${route.taskCount} model=${chosenModel} maxTurns=${route.maxTurns} editCap=${editCap === Infinity ? "∞" : editCap} browserVerify=${route.browserVerify}`);
 
   const onMessage = (m) => {
     if (m.type === "assistant" && Array.isArray(m.message?.content)) {
@@ -122,7 +125,7 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     if (attempt > 1) log(`[retry] attempt ${attempt}/${MAX_ATTEMPTS} — re-running agent with verification feedback`);
 
     // 1) Agent edits the source.
-    const agent = await runAgentSession({ cwd: dir, instruction: effectiveInstruction + feedback, model: chosenModel, maxTurns: route.maxTurns, onMessage });
+    const agent = await runAgentSession({ cwd: dir, instruction: effectiveInstruction + feedback, model: chosenModel, maxTurns: route.maxTurns, editCap, onMessage });
     totalCost += agent.costUsd || 0;
     const _u = (agent.raw && agent.raw.usage) || {}, _mu = (agent.raw && agent.raw.modelUsage) || {};
     const _models = Object.keys(_mu).join(",") || (agent.raw && agent.raw.model) || chosenModel;
