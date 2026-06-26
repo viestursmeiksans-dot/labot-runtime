@@ -131,28 +131,48 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     log(`[usage] job_site=${siteId} tier=${tier} model=${models} in=${u.input_tokens || 0} out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_write=${u.cache_creation_input_tokens || 0} turns=${a.numTurns ?? 0} cost=$${(a.costUsd || 0).toFixed(4)} attempt=${attempt}`);
   };
   async function editPhase(feedback, attempt) {
-    if (tasks.length === 1) {
-      const a = await runAgentSession({ cwd: dir, instruction: tasks[0] + attachNote + feedback, model: chosenModel, maxTurns: route.maxTurns, editCap: capFor(route), onMessage });
-      usageLog(a, route.tier, chosenModel, attempt);
-      return a;
-    }
-    const summaries = [], allChecks = [];
-    let cost = 0, turns = 0, ok = true;
+    const multi = tasks.length > 1;
+    const summaries = [], allChecks = [], incomplete = [];
+    let cost = 0, turns = 0, completed = 0;
     for (let i = 0; i < tasks.length; i++) {
       const tr = triage(tasks[i]);
       const mdl = model || tr.model;
-      log(`[split] task ${i + 1}/${tasks.length} tier=${tr.tier} model=${mdl} :: ${tasks[i].replace(/\s+/g, " ").slice(0, 70)}`);
-      const a = await runAgentSession({ cwd: dir, instruction: tasks[i] + attachNote + feedback, model: mdl, maxTurns: tr.maxTurns, editCap: capFor(tr), onMessage });
-      usageLog(a, tr.tier, mdl, attempt);
-      cost += a.costUsd || 0; turns += a.numTurns || 0; ok = ok && a.ok;
-      const prose = String(a.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
-      if (prose) summaries.push(`• ${prose}`);
-      for (const c of parseVerify(a.text) || []) allChecks.push(c);
-      if (!a.ok) break; // a broken sub-task aborts the pass (caller reports agent_error)
+      // Image/attachment work is tool-heavy on a box with no image libraries → grant extra turns.
+      const maxTurns = tr.maxTurns + (attachNote ? 6 : 0);
+      if (multi) log(`[split] task ${i + 1}/${tasks.length} tier=${tr.tier} model=${mdl} turns=${maxTurns} :: ${tasks[i].replace(/\s+/g, " ").slice(0, 70)}`);
+      let a;
+      try {
+        a = await runAgentSession({ cwd: dir, instruction: tasks[i] + attachNote + feedback, model: mdl, maxTurns, editCap: capFor(tr), onMessage });
+        usageLog(a, tr.tier, mdl, attempt);
+      } catch (e) {
+        // The SDK THROWS on max_turns (and some transient errors). Never crash the job or discard the
+        // tree — a partly-finished task may have left valid edits. Record it as incomplete and move
+        // on; the build/verify gate below decides what actually ships. (This is the fix for the v1
+        // bug where one over-budget sub-task emitted a raw "maximum number of turns" to the client.)
+        const reason = /maximum number of turns/i.test(String(e)) ? "did not finish within the turn budget" : String(e).slice(0, 100);
+        log(`[split] task ${i + 1} INCOMPLETE (${reason}) — keeping any partial edits, continuing`);
+        incomplete.push({ task: tasks[i], reason });
+        continue;
+      }
+      cost += a.costUsd || 0; turns += a.numTurns || 0;
+      if (a.ok) {
+        completed++;
+        const prose = String(a.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+        if (prose) summaries.push(multi ? `• ${prose}` : prose);
+        for (const c of parseVerify(a.text) || []) allChecks.push(c);
+      } else {
+        incomplete.push({ task: tasks[i], reason: a.error || "could not complete" });
+      }
     }
     const text = summaries.join("\n") + (allChecks.length ? `\n\n<VERIFY>${JSON.stringify(allChecks)}</VERIFY>` : "");
-    return { ok, text, costUsd: cost, numTurns: turns, raw: {} };
+    // ok = "proceed to the gate". The tree gate (changed? builds? verifies?) is the real arbiter, even
+    // for partial runs — so we proceed whenever anything ran, and report incompletes honestly.
+    return { ok: completed > 0 || incomplete.length > 0, text, costUsd: cost, numTurns: turns, incomplete, raw: {} };
   }
+  // Honest, non-technical Latvian suffix for any tasks we could not finish (NEVER a raw stack trace).
+  const incompleteSuffix = (inc) => inc && inc.length
+    ? `\n\n⏳ Šīs daļas mēs vēl pabeidzam un informēsim atsevišķi:\n${inc.map((t) => `  – ${String(t.task).replace(/\s+/g, " ").slice(0, 90)}`).join("\n")}`
+    : "";
 
   // Retry-on-verify-fail loop (spec B2): if the deterministic check says it isn't live+working, feed
   // the failure back to the SAME agent and retry within budget — no separate AI grading pass.
@@ -166,12 +186,17 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     // 1) Agent edits the source (single session, or one per sub-task — merged result either way).
     const agent = await editPhase(feedback, attempt);
     totalCost += agent.costUsd || 0;
-    log(`[agent] done ok=${agent.ok} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
-    if (!agent.ok) return { siteId, ok: false, status: "agent_error", report: agent.text || agent.error, costUsd: totalCost };
+    const incNote = incompleteSuffix(agent.incomplete);
+    log(`[agent] done completed=${agent.ok} incomplete=${(agent.incomplete || []).length} cost=$${(agent.costUsd || 0).toFixed(3)} turns=${agent.numTurns ?? "?"}`);
 
-    // 2) Did anything change?
+    // 2) Did anything change? (Even a crashed/over-budget sub-task may have left valid partial edits.)
     const status = git(["status", "--porcelain"], dir);
     if (!status) {
+      // Nothing shippable in the tree. If some tasks failed, say so honestly — never a stack trace.
+      if ((agent.incomplete || []).length) {
+        return { siteId, ok: false, status: "incomplete", costUsd: totalCost,
+          report: `Pagaidām šo nepaspējām pabeigt automātiski — mūsu komanda to pārņem un izdarīs manuāli.${incNote}` };
+      }
       if (attempt === 1) return { siteId, ok: false, status: "no_change", report: agent.text, costUsd: totalCost };
       log(`[retry] agent made no further change — keeping last pushed result`);
       return lastUnverified;
@@ -204,7 +229,7 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     } else { log(`[dry-run] build passed; NOT committing (pass commit:true / --commit to push)`); }
 
     // 6) Verification done-gate. No model self-grading: wait for the live deploy, assert facts.
-    const clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim();
+    const clientReport = String(agent.text || "").replace(/<VERIFY>[\s\S]*?<\/VERIFY>/i, "").trim() + incNote;
     if (!commit || !site.url) {
       return { siteId, ok: true, status: commit ? "committed" : "dry_run", tier: route.tier, model: chosenModel, verified: null, verifyResults: [], files, committedSha, costUsd: totalCost, report: clientReport };
     }
