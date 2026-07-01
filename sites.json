@@ -26,5 +26,19 @@
     "build": "npm ci && npx @11ty/eleventy",
     "model": "claude-sonnet-4-6",
     "url": "https://runasskola.lv"
+  },
+  "dentbridge": {
+    "repo": "viestursmeiksans-dot/dentbridge-web",
+    "branch": "main",
+    "build": "npm ci && npx @11ty/eleventy",
+    "model": "claude-sonnet-4-6",
+    "url": "https://dentbridge.eu"
+  },
+  "leviamethod": {
+    "repo": "viestursmeiksans-dot/leviamethod-web",
+    "branch": "main",
+    "build": "npm ci && npx @11ty/eleventy",
+    "model": "claude-sonnet-4-6",
+    "url": "https://leviamethod.com"
   }
 }
