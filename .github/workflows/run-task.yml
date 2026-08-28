@@ -1,0 +1,49 @@
+# labot.lv edit runtime — replaces the always-on VPS poller.
+#
+# The intake Worker dispatches this the moment a client's email lands; the runner claims the job
+# from D1 via /agent/pull, edits the site with the Agent SDK, verifies the 11ty build, pushes
+# (the site repo's own Action then deploys to Pages) and reports back via /agent/complete, which
+# is what emails the client.
+#
+# The schedule is the safety net: if a dispatch ever fails (GitHub API blip, expired PAT), the job
+# sits 'pending' in D1 and the next scheduled run drains it instead of it being lost in silence —
+# the exact failure mode that took the VPS down without anyone noticing.
+name: run-task
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "D1 job id that triggered this run (traceability only — the runner drains the queue)"
+        required: false
+        type: string
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: labot-runtime          # one edit at a time; same blast-radius rule the VPS had
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20      # matches the site repos' build; newer Node breaks Eleventy 3
+          cache: npm
+
+      - run: npm ci
+
+      - name: Drain the job queue
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          AGENT_SECRET: ${{ secrets.AGENT_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.SITES_PAT }}   # needs contents:write on every site repo
+          LABOT_SITES_DIR: ${{ runner.temp }}/sites
+          MAX_JOBS: "5"
+        run: node src/once.mjs

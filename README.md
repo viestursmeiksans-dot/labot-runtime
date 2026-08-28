@@ -33,6 +33,23 @@ node src/run.mjs --site resonatekit --instruction "..." --commit
 
 `sites.json` is the registry: `{ "<id>": { repo, branch, build, model } }`.
 
+## Where jobs actually run
+
+Two interchangeable runtimes drain the same D1 queue through the same `/agent/pull` endpoint:
+
+| runtime | how it starts | when to use |
+|---|---|---|
+| **GitHub Actions** (`.github/workflows/run-task.yml`, `src/once.mjs`) | intake Worker dispatches it per job; `*/15` cron drains stragglers | default — nothing to keep alive, nothing to pay for |
+| **VPS poller** (`src/poll.mjs`) | systemd/crontab on the box, loops forever | only if sub-minute latency matters |
+
+`/agent/pull` claims atomically, so both may run at once without double-processing a job. The CI
+path needs repo secrets `AGENT_SECRET`, `ANTHROPIC_API_KEY`, `SITES_PAT` (contents:write on every
+site repo) and repo variable `WORKER_URL`; checkouts go to `$LABOT_SITES_DIR` instead of `/srv/sites`.
+
+**Why the cron matters:** if a dispatch fails, the job sits `pending` in D1 and the client hears
+nothing. The schedule is what turns a silent stall into a 15-minute delay. The VPS died unnoticed
+in Aug 2026 precisely because nothing swept the queue behind it.
+
 ## Next (not in this MVP)
 - Queue poller (drain a `jobs` table / Cloudflare Queue) → run jobs autonomously.
 - Triage → model routing (Haiku/Sonnet/Opus) per request.

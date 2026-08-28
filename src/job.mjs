@@ -31,7 +31,7 @@ function repoUrl(repo) {
 
 // Part D2: fetch the client's image attachments (stashed in R2) onto the box, saved OUTSIDE the repo,
 // and return a note telling the agent where they are.
-const ATTACH_DIR = "/srv/sites/_inbox";
+const ATTACH_DIR = path.join(SITES_DIR, "_inbox");   // follows LABOT_SITES_DIR (VPS: /srv/sites, CI: runner workspace)
 async function downloadAttachments(attachmentsJson, workerBase, secret, jobTag, log) {
   let list;
   try { list = JSON.parse(attachmentsJson || "[]"); } catch { return ""; }
