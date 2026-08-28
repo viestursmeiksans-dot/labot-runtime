@@ -199,8 +199,16 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
       return { siteId, ok: true, status: "committed", model: chosenModel, verified: true, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport };
     }
     lastUnverified = { siteId, ok: true, status: "committed_unverified", model: chosenModel, verified: false, verifyResults: v.results, files, committedSha, costUsd: totalCost, report: clientReport + UNVERIFIED_NOTE };
+    // A check that was SKIPPED (no chromium on this box) is not a failed change — it is a missing
+    // capability, and re-running the agent cannot install a browser. Retrying there costs a full
+    // extra session (~90s, ~$0.40) and always lands back here. Only retry on a real failure.
+    const realFailures = v.results.filter((r) => !r.ok && !r.skipped);
+    if (!realFailures.length) {
+      log(`[verify] nothing retryable (${v.results.filter((r) => r.skipped).length} check(s) skipped — no browser here) — not re-running the agent`);
+      return lastUnverified;
+    }
     if (attempt < MAX_ATTEMPTS) {
-      feedback = `\n\n[VERIFICATION FAILED — the change is LIVE but a deterministic browser/HTTP check shows it is NOT working as intended:\n${summarizeFailures(v.results)}\nInvestigate the actual deployed page + the source, find the real cause, fix it (do not just repeat the same edit), rebuild, and re-declare the <VERIFY> block.]`;
+      feedback = `\n\n[VERIFICATION FAILED — the change is LIVE but a deterministic browser/HTTP check shows it is NOT working as intended:\n${summarizeFailures(realFailures)}\nInvestigate the actual deployed page + the source, find the real cause, fix it (do not just repeat the same edit), rebuild, and re-declare the <VERIFY> block.]`;
       continue;
     }
     return lastUnverified;

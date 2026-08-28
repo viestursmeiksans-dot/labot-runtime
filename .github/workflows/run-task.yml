@@ -38,6 +38,17 @@ jobs:
 
       - run: npm ci
 
+      # Chromium makes the V2 interactive checks real. Without it they come back "skipped", the job
+      # can only ever report committed_unverified, and the client is told "done, but unverified".
+      # ~20s with the cache; far cheaper than the extra agent session it used to trigger.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('package-lock.json') }}
+
+      - run: npx playwright install --with-deps chromium
+
       - name: Drain the job queue
         env:
           WORKER_URL: ${{ vars.WORKER_URL }}
