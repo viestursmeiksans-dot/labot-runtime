@@ -173,7 +173,13 @@ export async function runJob({ siteId, instruction, model, commit = false, log =
     let committedSha = null;
     if (commit) {
       git(["add", "-A"], dir);
-      git(["commit", "-m", `labot: ${instruction.replace(/\s+/g, " ").slice(0, 60)}`], dir);
+      // Identity is passed per-command, not assumed from global git config: the VPS had one
+      // configured, a CI runner does not (and a commit with no ident is a hard fatal).
+      git([
+        "-c", `user.name=${process.env.GIT_AUTHOR_NAME || "labot"}`,
+        "-c", `user.email=${process.env.GIT_AUTHOR_EMAIL || "labot@labot.lv"}`,
+        "commit", "-m", `labot: ${instruction.replace(/\s+/g, " ").slice(0, 60)}`,
+      ], dir);
       git(["push", "origin", site.branch], dir);
       committedSha = git(["rev-parse", "HEAD"], dir);
       log(`[push] ${committedSha} → origin/${site.branch} (Action will deploy)`);
